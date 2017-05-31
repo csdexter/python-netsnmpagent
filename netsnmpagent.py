@@ -338,11 +338,12 @@ class netsnmpAgent(object):
 		# Initialize our SNMP object registry
 		self._objs = defaultdict(dict)
 
-	def _prepareRegistration(self, oidstr, writable = True):
+	def _prepareRegistration(self, oidstr, writable = True, callback = None):
 		""" Prepares the registration of an SNMP object.
 
 		    "oidstr" is the OID to register the object at.
-		    "writable" indicates whether "snmpset" is allowed. """
+		    "writable" indicates whether "snmpset" is allowed.
+		    "callback" is an optional C callback that gets called on SET. """
 
 		# Make sure the agent has not been start()ed yet
 		if self._status != netsnmpAgentStatus.REGISTRATION:
@@ -383,7 +384,7 @@ class netsnmpAgent(object):
 		# left to net-snmp.
 		handler_reginfo = libnsa.netsnmp_create_handler_registration(
 			b(oidstr),
-			None,
+			callback,
 			oid,
 			oid_len,
 			handler_modes
@@ -416,7 +417,7 @@ class netsnmpAgent(object):
 		    yet. Use the Register() method to associate it with an OID. """
 
 		# This is the replacement function, the "decoration"
-		def create_vartype_class(self, initval = None, oidstr = None, writable = True, context = ""):
+		def create_vartype_class(self, initval = None, oidstr = None, writable = True, context = "", write_callback = None):
 			agent = self
 
 			# Call the original property_func to retrieve this variable type's
@@ -456,8 +457,15 @@ class netsnmpAgent(object):
 						self._max_size  = max(self._data_size, props["max_size"])
 
 					if oidstr:
+						if writable and write_callback is not None:
+							if not callable(write_callback):
+								raise netsnmpAgentException("Attempted to register non-callable callback for SET operation!")
+							self._callback = Netsnmp_Node_Handler(lambda a, b, c, d: self._callback_helper(a, b, c, d, write_callback))
+						else:
+							self._callback = ctypes.cast(None, Netsnmp_Node_Handler)
+
 						# Prepare the netsnmp_handler_registration structure.
-						handler_reginfo = agent._prepareRegistration(oidstr, writable)
+						handler_reginfo = agent._prepareRegistration(oidstr, writable, self._callback)
 						handler_reginfo.contents.contextName = b(context)
 
 						# Create the netsnmp_watcher_info structure.
@@ -485,6 +493,11 @@ class netsnmpAgent(object):
 						# Finally, we keep track of all registered SNMP objects for the
 						# getRegistered() method.
 						agent._objs[context][oidstr] = self
+
+				def _callback_helper(self, mib_handler, handler_registration, agent_request_info, request_info, real_callback):
+					if agent_request_info.mode == MODE_SET_COMMIT:
+						real_callback()
+					return SNMP_ERR_NOERROR
 
 				def value(self):
 					val = self._cvar.value
@@ -529,7 +542,7 @@ class netsnmpAgent(object):
 		return create_vartype_class
 
 	@VarTypeClass
-	def Integer32(self, initval = None, oidstr = None, writable = True, context = ""):
+	def Integer32(self, initval = None, oidstr = None, writable = True, context = "", callback = None):
 		return {
 			"ctype"         : ctypes.c_long,
 			"flags"         : WATCHER_FIXED_SIZE,
@@ -538,7 +551,7 @@ class netsnmpAgent(object):
 		}
 
 	@VarTypeClass
-	def Unsigned32(self, initval = None, oidstr = None, writable = True, context = ""):
+	def Unsigned32(self, initval = None, oidstr = None, writable = True, context = "", callback = None):
 		return {
 			"ctype"         : ctypes.c_ulong,
 			"flags"         : WATCHER_FIXED_SIZE,
@@ -547,7 +560,7 @@ class netsnmpAgent(object):
 		}
 
 	@VarTypeClass
-	def Counter32(self, initval = None, oidstr = None, writable = True, context = ""):
+	def Counter32(self, initval = None, oidstr = None, writable = True, context = "", callback = None):
 		return {
 			"ctype"         : ctypes.c_ulong,
 			"flags"         : WATCHER_FIXED_SIZE,
@@ -556,7 +569,7 @@ class netsnmpAgent(object):
 		}
 
 	@VarTypeClass
-	def Counter64(self, initval = None, oidstr = None, writable = True, context = ""):
+	def Counter64(self, initval = None, oidstr = None, writable = True, context = "", callback = None):
 		return {
 			"ctype"         : counter64,
 			"flags"         : WATCHER_FIXED_SIZE,
@@ -565,7 +578,7 @@ class netsnmpAgent(object):
 		}
 
 	@VarTypeClass
-	def TimeTicks(self, initval = None, oidstr = None, writable = True, context = ""):
+	def TimeTicks(self, initval = None, oidstr = None, writable = True, context = "", callback = None):
 		return {
 			"ctype"         : ctypes.c_ulong,
 			"flags"         : WATCHER_FIXED_SIZE,
@@ -579,7 +592,7 @@ class netsnmpAgent(object):
 	# we have to stick to WATCHER_MAX_SIZE for now to support net-snmp 5.4.x
 	# (used eg. in SLES 11 SP2 and Ubuntu 12.04 LTS).
 	@VarTypeClass
-	def OctetString(self, initval = None, oidstr = None, writable = True, context = ""):
+	def OctetString(self, initval = None, oidstr = None, writable = True, context = "", callback = None):
 		return {
 			"ctype"         : ctypes.create_string_buffer,
 			"flags"         : WATCHER_MAX_SIZE,
@@ -591,7 +604,7 @@ class netsnmpAgent(object):
 	# Whereas an OctetString can contain UTF-8 encoded characters, a
 	# DisplayString is restricted to ASCII characters only.
 	@VarTypeClass
-	def DisplayString(self, initval = None, oidstr = None, writable = True, context = ""):
+	def DisplayString(self, initval = None, oidstr = None, writable = True, context = "", callback = None):
 		return {
 			"ctype"         : ctypes.create_string_buffer,
 			"flags"         : WATCHER_MAX_SIZE,
@@ -602,7 +615,7 @@ class netsnmpAgent(object):
 
 	# IP addresses are stored as unsigned integers, but the Python interface
 	# should use strings. So we need a special class.
-	def IpAddress(self, initval = "0.0.0.0", oidstr = None, writable = True, context = ""):
+	def IpAddress(self, initval = "0.0.0.0", oidstr = None, writable = True, context = "", callback = None):
 		agent = self
 
 		class IpAddress(object):
@@ -615,8 +628,15 @@ class netsnmpAgent(object):
 				self.update(initval)
 
 				if oidstr:
+					if writable and callback is not None:
+						if not callable(callback):
+							raise netsnmpAgentException("Attempted to register non-callable callback for SET operation!")
+						self._callback = Netsnmp_Node_Handler(lambda a, b, c, d: self._callback_helper(a, b, c, d, write_callback))
+					else:
+						self._callback = ctypes.cast(None, Netsnmp_Node_Handler)
+
 					# Prepare the netsnmp_handler_registration structure.
-					handler_reginfo = agent._prepareRegistration(oidstr, writable)
+					handler_reginfo = agent._prepareRegistration(oidstr, writable, callback)
 					handler_reginfo.contents.contextName = b(context)
 
 					# Create the netsnmp_watcher_info structure.
@@ -639,6 +659,11 @@ class netsnmpAgent(object):
 					# Finally, we keep track of all registered SNMP objects for the
 					# getRegistered() method.
 					agent._objs[context][oidstr] = self
+
+			def _callback_helper(self, mib_handler, handler_registration, agent_request_info, request_info, real_callback):
+					if agent_request_info.mode == MODE_SET_COMMIT:
+						real_callback()
+					return SNMP_ERR_NOERROR
 
 			def value(self):
 				# Get string representation of IP address.
@@ -669,7 +694,7 @@ class netsnmpAgent(object):
 		# Return an instance of the just-defined class to the agent
 		return IpAddress()
 
-	def Table(self, oidstr, indexes, columns, counterobj = None, extendable = False, context = ""):
+	def Table(self, oidstr, indexes, columns, counterobj = None, extendable = False, context = "", callback = None):
 		agent = self
 
 		# Define a Python class to provide access to the table.
@@ -710,10 +735,18 @@ class netsnmpAgent(object):
 							"error code {0}!".format(result)
 						)
 
+				if extendable and callback is not None:
+					if not callable(callback):
+						raise netsnmpAgentException("Attempted to register non-callable callback for SET operation!")
+					self._callback = Netsnmp_Node_Handler(lambda a, b, c, d: self._callback_helper(a, b, c, d, write_callback))
+				else:
+					self._callback = ctypes.cast(None, Netsnmp_Node_Handler)
+
 				# Register handler and table_data_set with net-snmp.
 				self._handler_reginfo = agent._prepareRegistration(
 					oidstr,
-					extendable
+					extendable,
+					self._callback
 				)
 				self._handler_reginfo.contents.contextName = b(context)
 				result = libnsX.netsnmp_register_table_data_set(
@@ -784,6 +817,11 @@ class netsnmpAgent(object):
 					self._counterobj.update(self._counterobj.value() + 1)
 
 				return row
+
+			def _callback_helper(self, mib_handler, handler_registration, agent_request_info, request_info, real_callback):
+				if agent_request_info.mode == MODE_SET_COMMIT:
+					real_callback()
+				return SNMP_ERR_NOERROR
 
 			def value(self):
 				# Because tables are more complex than scalar variables, we
